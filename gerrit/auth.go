@@ -227,17 +227,18 @@ func getDigestAuthString(auth *digestAuth, url *url.URL, method string, nc int) 
 
 	buf.Write([]byte("Digest "))
 	fmt.Fprintf(&buf,
-		"username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\"",
-		auth.Username, auth.Realm, auth.NONCE, url.Path, respdig)
+		`username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
+		auth.Username, auth.Realm, auth.NONCE, url.Path, respdig,
+	)
 
 	if auth.Opaque != "" {
-		fmt.Fprintf(&buf, ", opaque=\"%s\"", auth.Opaque)
+		fmt.Fprintf(&buf, `, opaque="%s"`, auth.Opaque)
 	}
 	if auth.QOP != "" {
-		fmt.Fprintf(&buf, ", qop=\"%s\", nc=%s, cnonce=\"%s\"", auth.QOP, ncStr, hnc)
+		fmt.Fprintf(&buf, `, qop="%s", nc=%s, cnonce="%s"`, auth.QOP, ncStr, hnc)
 	}
 	if auth.Algorithm != "" {
-		fmt.Fprintf(&buf, ", algorithm=\"%s\"", auth.Algorithm)
+		fmt.Fprintf(&buf, `, algorithm="%s"`, auth.Algorithm)
 	}
 
 	return buf.String()

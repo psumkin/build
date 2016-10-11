@@ -5,65 +5,175 @@
 package gerrit
 
 import (
-	"flag"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-var gerritGitCookieFile, gerritPassword, gerritUser, gerritURL string
-
-func init() {
-	flag.StringVar(
-		&gerritGitCookieFile,
-		"gerrit-gitcookie-file",
-		filepath.Join(os.Getenv("HOME"), ".gitcookies"),
-		"Git cookie file for gitcookiefile authentication",
-	)
-	flag.StringVar(
-		&gerritPassword,
-		"gerrit-password",
-		"tbot",
-		"Gerrit password for basic or digest authentication",
-	)
-	flag.StringVar(
-		&gerritUser,
-		"gerrit-user",
-		"tbot",
-		"Gerrit user for basic or digest authentication",
-	)
-	flag.StringVar(
-		&gerritURL,
-		"gerrit-url",
-		"https://go-review.googlesource.com",
-		"Gerrit URL",
-	)
-	flag.Parse()
-}
-
-func getChanges(t *testing.T, c *Client) {
-	_, err := c.QueryChanges("is:open", QueryChangesOpt{})
-	if err != nil {
-		t.Fatal(err)
-	}
+func MD5(text string) string {
+	h := md5.Sum([]byte(text))
+	return hex.EncodeToString(h[:])
 }
 
 func TestBasicAuth(t *testing.T) {
-	getChanges(t, NewClient(gerritURL, BasicAuth(gerritUser, gerritPassword)))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expected := "User Password true"
+		u, p, ok := r.BasicAuth()
+		if expected != fmt.Sprintf("%s %s %t", u, p, ok) {
+			t.Errorf("Expected %s, got %s %s %t", expected, u, p, ok)
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+			// The JSON response begins with an XSRF-defeating header ")]}\n"
+			fmt.Fprintln(w, ")]}")
+			json.NewEncoder(w).Encode(AccountInfo{})
+		}
+	}))
+	defer ts.Close()
+
+	_, err := NewClient(
+		ts.URL,
+		BasicAuth("User", "Password"),
+	).GetAccountInfo("self")
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestDigestAuth(t *testing.T) {
-	getChanges(t, NewClient(gerritURL, DigestAuth(gerritUser, gerritPassword)))
+	const (
+		user   = "User"
+		pass   = "Password"
+		nonce  = "dcd98b7102dd2f0e8b11d0f600bfb0c093"
+		opaque = "5ccc069c403ebaf9f0171e9517f40e41"
+		realm  = "Gerrit Code Review"
+		qop    = "auth"
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Authorization")
+		if header == "" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Digest realm="%s", qop="%s", nonce="%s", opaque="%s"`,
+				realm, qop, nonce, opaque,
+			))
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			parts := strings.SplitN(header, " ", 2)
+			parts = strings.Split(parts[1], ", ")
+			opts := make(map[string]string)
+
+			for _, part := range parts {
+				vals := strings.SplitN(part, "=", 2)
+				key := vals[0]
+				val := strings.Trim(vals[1], "\",")
+				opts[key] = val
+			}
+
+			// https://en.wikipedia.org/wiki/Digest_access_authentication#Example_with_explanation
+			// The "response" value is calculated in three steps, as follows.
+			//   Where values are combined, they are delimited by colons.
+			// 1. The MD5 hash of the combined username, authentication realm and password is calculated.
+			//    The result is referred to as HA1.
+			// 2. The MD5 hash of the combined method and digest URI is calculated, e.g. of "GET" and "/index.html".
+			//    The result is referred to as HA2.
+			// 3. The MD5 hash of the combined HA1 result, server nonce (nonce), request counter (nc),
+			//    client nonce (cnonce), quality of protection code (qop) and HA2 result is calculated.
+			//    The result is the "response" value provided by the client.
+			ha1 := MD5(fmt.Sprintf("%s:%s:%s", user, realm, pass))
+			ha2 := MD5("GET:/a/accounts/self")
+			expected := MD5(fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, nonce, opts["nc"], opts["cnonce"], qop, ha2))
+
+			if expected != opts["response"] {
+				t.Errorf("Expected %s, got %s", expected, opts["response"])
+				w.WriteHeader(http.StatusUnauthorized)
+			} else {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				// The JSON response begins with an XSRF-defeating header ")]}\n"
+				fmt.Fprintln(w, ")]}")
+				json.NewEncoder(w).Encode(AccountInfo{})
+			}
+		}
+	}))
+	defer ts.Close()
+
+	_, err := NewClient(
+		ts.URL,
+		DigestAuth(user, pass),
+	).GetAccountInfo("self")
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestGitCookiesAuth(t *testing.T) {
-	getChanges(t, NewClient(gerritURL, GitCookiesAuth()))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Log("--", r)
+
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		// The JSON response begins with an XSRF-defeating header ")]}\n"
+		fmt.Fprintln(w, ")]}")
+		json.NewEncoder(w).Encode(AccountInfo{})
+	}))
+	defer ts.Close()
+
+	_, err := NewClient(
+		ts.URL,
+		GitCookiesAuth(),
+	).GetAccountInfo("self")
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestGitCookieFileAuth(t *testing.T) {
-	getChanges(t, NewClient(gerritURL, GitCookieFileAuth(gerritGitCookieFile)))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Cookie")
+
+		t.Log("--", r, "\n---", header)
+
+		if header == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+
+			w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+			// The JSON response begins with an XSRF-defeating header ")]}\n"
+			fmt.Fprintln(w, ")]}")
+			json.NewEncoder(w).Encode(AccountInfo{})
+		}
+	}))
+	defer ts.Close()
+
+	_, err := NewClient(
+		ts.URL,
+		GitCookieFileAuth(filepath.Join(os.Getenv("HOME"), ".gitcookies")),
+	).GetAccountInfo("self")
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestNoAuth(t *testing.T) {
-	getChanges(t, NewClient(gerritURL, NoAuth))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		// The JSON response begins with an XSRF-defeating header ")]}\n"
+		fmt.Fprintln(w, ")]}")
+		json.NewEncoder(w).Encode(AccountInfo{})
+	}))
+	defer ts.Close()
+
+	_, err := NewClient(
+		ts.URL,
+		NoAuth,
+	).GetAccountInfo("self")
+	if err != nil {
+		t.Error(err)
+	}
 }
